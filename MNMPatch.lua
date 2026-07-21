@@ -2,19 +2,26 @@
 --
 -- HANJO, Tokyo, Japan.
 --
--- 6 banks (one per MNM track), each with its own MIDI channel and
--- its own randomized CC values. CC target layout is shared across
+-- 7 banks, each with its own MIDI channel and its own randomized CC
+-- values. Banks 1-6 map to MNM tracks 1-6; bank 7 ("CUR") defaults to
+-- channel 9, the MNM auto channel, so it always addresses whatever track
+-- is currently selected on the machine. CC target layout is shared across
 -- banks (so the 7 pages of CCs hit the same parameters on every
 -- track, just with independent random values).
 --
+-- K1: Query the MNM (sysex workspace-kit request on the main output) for
+--     the machine assigned to each track; the active bank's machine then
+--     shows in the header in place of the channel.
 -- K3: Randomize CC values on the current page of the active bank.
 --     Hold K3: while held, note-ons on the auto-lock trigger port reroll
 --     the whole current page (Auto Page Roll).
--- E1: Change page (1..7). Scroll left past SYNTH to the "ALL" page,
---     where K3 rolls every page of the active bank at once.
--- K1 + E1: Change active bank (1..6).
--- E2: Select CC slot.
+-- E1: Change active bank (1..6 = tracks, 7 = CUR/auto channel).
+-- E2: Change page (1..7). Scroll left past SYNTH to the "ALL" page
+--     (K3 rolls every page of the active bank at once), then further
+--     left to "NO LFO" (K3 rolls every page except the three LFOs).
 -- K2: Cycle edit mode (CC / VAL / MIDI channel).
+--     On the ALL page, holding K2 fills a popup bar; held to full, it
+--     clears DPTH to 0 on all three LFOs of the active bank.
 -- E3: Adjust CC, value, or active bank's MIDI channel.
 -- Scroll to CC -1 : OFF feature.
 --
@@ -29,6 +36,8 @@
 --   continue / stop and song position. The secondary output port
 --   (port 2) is configurable (default 2); the main output is port 1.
 --
+
+local mnm_sysex = include("lib/mnm_sysex")
 
 local midi_out
 local midi_out_2
@@ -70,39 +79,59 @@ local NOTE_CHAN_OPTIONS = { "1:1 passthrough", "active bank" }
 
 local num_slots_per_page = 8
 local num_pages = 7
-local num_banks = 6
 
--- Page 0 is the virtual "ALL" page: it displays the SYNTH page's slots but
--- K3 there rolls every page of the active bank at once.
+-- Banks 1-6 map to MNM tracks 1-6. Bank 7 is the "CUR" bank: it defaults
+-- to channel 9, the MNM's auto channel, so its CCs always hit whatever
+-- track is currently selected on the machine.
+local num_banks = 7
+local CUR_BANK = 7
+local CUR_BANK_DEFAULT_CHANNEL = 9
+
+local function bank_default_channel(bank)
+  return bank == CUR_BANK and CUR_BANK_DEFAULT_CHANNEL or bank
+end
+
+local function bank_display_name(bank)
+  return bank == CUR_BANK and "CUR" or ("B" .. bank)
+end
+
+-- Virtual pages left of SYNTH. Both display the SYNTH page's slots:
+--   Page  0 ("ALL"):    K3 rolls every page of the active bank at once.
+--   Page -1 ("NO LFO"): K3 rolls every non-LFO page (SYNTH/AMP/FILTER/
+--                       EFFECTS), leaving all three LFOs untouched.
 local ALL_PAGE = 0
+local ALL_NOLFO_PAGE = -1
+local FIRST_PAGE = ALL_NOLFO_PAGE
 local current_page = 1
 
 local function effective_page()
   return math.max(current_page, 1)
 end
-local current_bank = 1
-local k1_held = false
+local current_bank = CUR_BANK
 
 -- CC target layout is shared across all banks; only values vary per bank.
 -- cc_labels (optional) name each slot for display. SYNTH is intentionally
 -- left unlabeled and falls back to showing "CC###" in the UI.
 local LFO_LABELS = { "PAGE", "DEST", "TRIG", "WAVE", "MULT", "SPD", "INTL", "DPTH" }
+local FILTER_LABELS = { "BASE", "WDTH", "HFQ", "LFQ", "ATK", "DEC", "BDFS", "WDFS" }
 
 -- Params (by label) that K3 / auto-lock rolls must never touch.
 -- Manual edits (E3 in VAL mode) still work on these slots.
-local LFO_ROLL_EXCLUDE = { MULT = true, SPD = true }
+local LFO_ROLL_EXCLUDE = { SPD = true }
 
 local page_data = {
   { title = "SYNTH",  cc_targets = {48, 49, 50, 51, 52, 53, 54, 55} },
   { title = "AMP",    cc_targets = {56, 57, 58, 59, 60, 61, 62, 63},
                       cc_labels  = {"ATK", "HOLD", "DEC", "REL", "DIST", "VOL", "PAN", "PORT"},
-                      roll_exclude = { ATK = true, HOLD = true, REL = true, VOL = true, PAN = true, PORT = true } },
+                      roll_exclude = { ATK = true, HOLD = true, DEC = true, REL = true, VOL = true, PAN = true, PORT = true },
+                      roll_min     = { DIST = 64 } },
   { title = "FILTER", cc_targets = {72, 73, 74, 75, 76, 77, 78, 79},
-                      cc_labels  = {"BASE", "WDTH", "HFQ", "LFQ", "ATK", "DEC", "BDFS", "WDFS"},
-                      roll_exclude = { BASE = true, WDTH = true, ATK = true, BDFS = true, WDFS = true } },
+                      cc_labels  = FILTER_LABELS,
+                      roll_exclude = { ATK = true, DEC = true } },
   { title = "EFFECTS",cc_targets = {80, 81, 82, 83, 84, 85, 86, 87},
                       cc_labels  = {"EQF", "EQG", "SRR", "DTIM", "DSND", "DFB", "DBAS", "DWID"},
-                      roll_exclude = { DTIM = true, DSND = true, DFB = true, DBAS = true, DWID = true } },
+                      roll_exclude = { SRR = true, DTIM = true, DSND = true, DFB = true, DBAS = true, DWID = true },
+                      roll_min     = { EQG = 64 } },
   { title = "LFO 1",  cc_targets = {88,  89,  90,  91,  92,  93,  94,  95},  cc_labels = LFO_LABELS, roll_exclude = LFO_ROLL_EXCLUDE },
   { title = "LFO 2",  cc_targets = {104, 105, 106, 107, 108, 109, 110, 111}, cc_labels = LFO_LABELS, roll_exclude = LFO_ROLL_EXCLUDE },
   { title = "LFO 3",  cc_targets = {112, 113, 114, 115, 116, 117, 118, 119}, cc_labels = LFO_LABELS, roll_exclude = LFO_ROLL_EXCLUDE }
@@ -120,40 +149,114 @@ local function is_roll_excluded(page, slot)
   return label ~= nil and page.roll_exclude[label] == true
 end
 
+-- Per-label floor for rolled values (page.roll_min): params like DIST and
+-- EQG must never roll below 64. Returns nil when no floor applies.
+local function roll_min_for(page, slot)
+  if not (page.roll_min and page.cc_labels) then return nil end
+  local label = page.cc_labels[slot]
+  return label and page.roll_min[label] or nil
+end
+
 -- LFO PAGE/DEST constrained rolling ------------------------------------
 -- PAGE and DEST are discrete-list params driven by a continuous CC: the
--- MNM splits 0..127 into even buckets (PAGE: 5 entries, DEST: 8 entries,
+-- MNM splits 0..127 into even buckets (PAGE: 9 entries, DEST: 8 entries,
 -- ordered like the target page's 8 knobs). Rolling them freely could aim
 -- an LFO at a param we've excluded from rolling, modulating it anyway.
 -- Instead, rolls pick a random (page, dest) pair from the allowlist below
 -- and emit the midpoint CC value of each bucket.
-local LFO_TARGET_PAGE_OPTIONS = { "SYN", "AMP", "FLT", "EFF", "LFO" }
+--
+-- HARDWARE-VERIFIED (probing session, Jul 2026): the LFO PAGE CC selects
+-- from NINE pages, not 8, so buckets are 128/9 ~ 14.2 wide. Probe results:
+--   10 -> PTCH, 32 -> AMP, 56 -> FLT, 72 -> LFO1, 120 -> MIDI, 64 -> EFF
+-- All consistent with this order and bucket width (page N, 1-based,
+-- spans floor((N-1)*128/9) .. floor(N*128/9)-1):
+--   PTCH 0-13, SYN 14-27, AMP 28-42, FLT 43-56, EFF 57-70,
+--   LFO1 71-85, LFO2 86-99, LFO3 100-113, MIDI 114-127
+-- Gotcha for future work: assuming 8 x 16-wide buckets *appears* to work
+-- for the first four pages (their midpoints happen to fall in the right
+-- 9-page buckets) but breaks from EFF upward (16-wide midpoint 72 lands
+-- in LFO1's bucket).
+-- The DEST CC is different: it has 8 even buckets (16-wide), one per knob
+-- slot of the target page, in that page's knob order (slot 1 = 0-15, etc).
+local LFO_TARGET_PAGE_OPTIONS = { "PTCH", "SYN", "AMP", "FLT", "EFF", "LFO1", "LFO2", "LFO3", "MIDI" }
 
 -- Allowed DEST slots (1..8) per target page; mirrors the roll exclusions
--- above (SYN slot 8 = CC 55; LFO page: MULT/SPD are slots 5/6).
+-- above (SYN slot 8 = CC 55). Pages absent from this table are never
+-- picked as roll targets. LFO_TARGET_PAGE_OPTIONS still lists every page
+-- so the PAGE CC bucket positions stay correct.
 local LFO_ALLOWED_DESTS = {
   SYN = { 1, 2, 3, 4, 5, 6, 7 },
-  AMP = { 3, 5 },              -- DEC, DIST
-  FLT = { 3, 4, 6 },           -- HFQ, LFQ, DEC
-  EFF = { 1, 2, 3 },           -- EQF, EQG, SRR
-  LFO = { 1, 2, 3, 4, 7, 8 },  -- everything but MULT/SPD
+  EFF = { 1 }  -- EQF only
 }
 
--- Flattened { page_value, dest_value } CC pairs, precomputed once.
+-- Precomputed target descriptors, one per allowed (page, dest) pair:
+--   page_val / dest_val = bucket-midpoint CC values to emit
+--   page_name / dest_slot = which page and 1-based knob it selects
+-- Midpoints of the 9-page layout above: PTCH 7, SYN 21, AMP 35, FLT 49,
+-- EFF 64, LFO1 78, LFO2 92, LFO3 106, MIDI 120. SYN=21 and EFF=64 are the
+-- pairs currently rolled and both are hardware-confirmed.
 local LFO_TARGET_PAIRS = {}
 for page_idx, page_name in ipairs(LFO_TARGET_PAGE_OPTIONS) do
   local page_val = math.floor((page_idx - 0.5) * 128 / #LFO_TARGET_PAGE_OPTIONS)
-  for _, dest_slot in ipairs(LFO_ALLOWED_DESTS[page_name]) do
+  for _, dest_slot in ipairs(LFO_ALLOWED_DESTS[page_name] or {}) do
     local dest_val = (dest_slot - 1) * 16 + 8
-    table.insert(LFO_TARGET_PAIRS, { page_val, dest_val })
+    table.insert(LFO_TARGET_PAIRS, {
+      page_val = page_val, dest_val = dest_val,
+      page_name = page_name, dest_slot = dest_slot,
+    })
   end
 end
 
 local LFO_PAGE_SLOT = 1
 local LFO_DEST_SLOT = 2
+local LFO_TRIG_SLOT = 3
+
+-- LFO TRIG is also a discrete list (5 entries, even buckets). Rolls may
+-- pick any mode except ONE and TRIG. Values are bucket midpoints.
+local LFO_TRIG_OPTIONS = { "FREE", "TRIG", "HOLD", "ONE", "HALF" }
+local LFO_TRIG_EXCLUDE = { ONE = true, TRIG = true }
+local LFO_ALLOWED_TRIG_VALUES = {}
+for idx, name in ipairs(LFO_TRIG_OPTIONS) do
+  if not LFO_TRIG_EXCLUDE[name] then
+    table.insert(LFO_ALLOWED_TRIG_VALUES,
+      math.floor((idx - 0.5) * 128 / #LFO_TRIG_OPTIONS))
+  end
+end
 
 local function is_lfo_page(page)
   return page.cc_labels == LFO_LABELS
+end
+
+-- FILTER constrained rolling -------------------------------------------
+-- The MNM filter is a band [BASE, BASE+WDTH]; rolling BASE/WDTH freely
+-- often lands the band above the audible range (silence). BDFS/WDFS are
+-- bipolar envelope offsets (64 = none) that sweep the band, so they can
+-- silence an otherwise-audible patch at envelope peak. Rolls therefore
+-- treat BASE+WDTH+BDFS+WDFS as one unit: pick a resting band that meets
+-- the audibility invariant, then roll offsets within the headroom that
+-- band leaves so the swept band stays audible too. The sweep is linear
+-- from rest to peak, so checking both endpoints covers every point.
+-- Set true to include the filter band (BASE/WDTH/BDFS/WDFS) in rolls.
+-- When false, those four slots are never rolled (pre-band-roll behaviour);
+-- manual E3 edits still work.
+local FILTER_BAND_ROLL_ENABLED = false
+
+local FILTER_BASE_SLOT = 1
+local FILTER_WIDTH_SLOT = 2
+local FILTER_BOFS_SLOT = 7
+local FILTER_WOFS_SLOT = 8
+local FILTER_GROUP_SLOTS = {
+  [FILTER_BASE_SLOT] = true, [FILTER_WIDTH_SLOT] = true,
+  [FILTER_BOFS_SLOT] = true, [FILTER_WOFS_SLOT] = true,
+}
+
+local FILTER_MIN_WIDTH = 40  -- narrowest band (resting or swept) ever rolled
+local FILTER_HI_MIN    = 88  -- band top must reach at least this far up
+local FILTER_LO_MAX    = 72  -- highest resting base
+local FILTER_MAX_SWEEP = 48  -- musical cap on envelope offset magnitude
+
+local function is_filter_page(page)
+  return page.cc_labels == FILTER_LABELS
 end
 
 -- Randomized values per bank/page/slot: bank_values[bank][page][slot] = 0..127
@@ -186,7 +289,9 @@ end
 --   While active, note-on messages on the secondary MIDI input that match
 --   the active bank's auto-lock channel reroll only the currently
 --   highlighted slot (single-param lock).
---   Channel mapping: bank N listens on channel N (bank 1 -> ch 1, ..., bank 6 -> ch 6).
+--   Channel mapping: bank N listens on channel N (bank 1 -> ch 1, ..., bank 6 -> ch 6);
+--   the CUR bank listens on the channel of the MNM's currently selected
+--   track (tracked via the current-audio-track status poll).
 --   A short K2 tap (released before the threshold) cycles edit mode instead.
 local AUTO_LOCK_HOLD_THRESHOLD = 0.25
 local auto_lock_active = false
@@ -201,8 +306,166 @@ local k2_hold_clock_id = nil
 local auto_roll_page_active = false
 local k3_hold_clock_id = nil
 
+-- LFO depth clear (ALL page only):
+--   Holding K2 on the ALL page shows a popup with a bar that fills over
+--   LFO_CLEAR_HOLD_TIME. If K2 is held until it fills, DPTH of all three
+--   LFOs on the active bank is set to 0 and sent. Releasing early cancels
+--   (a short tap still cycles edit mode, as on other pages).
+local LFO_DPTH_SLOT = 8
+local LFO_CLEAR_HOLD_TIME = 0.6
+local lfo_clear_clock_id = nil
+local lfo_clear_progress = nil  -- 0..1 while the popup is showing, else nil
+local lfo_clear_fired = false   -- suppresses edit-mode cycle on release
+
+-- Currently selected audio track on the MNM (1..6), kept fresh by the
+-- current-audio-track status poll. nil until the first response arrives.
+local mnm_current_track = nil
+
+-- Trigger channel a bank's auto-lock/auto-roll listens on. Banks 1-6
+-- listen on their own track's channel. The CUR bank follows whatever
+-- track is currently selected on the MNM (polled continuously via
+-- STATUS_CURRENT_AUDIO_TRACK); until the first poll answers, the track
+-- is unknown and this returns nil (no trigger channel matches yet).
 local function auto_lock_channel_for_bank(bank)
+  if bank == CUR_BANK then
+    return mnm_current_track
+  end
   return bank
+end
+
+-- MNM machine query:
+--   K1 sends a sysex workspace-kit request to the main output (assumed to
+--   be the Monomachine). The kit dump reply — which can arrive on either
+--   MIDI input — is parsed for the kit name and the machine assigned to
+--   each of the 6 tracks. The active bank's machine is shown in the
+--   header (banks 1-6; CUR keeps the channel display since the machine
+--   depends on which track the MNM has selected).
+local mnm_kit_name = nil
+local mnm_machines = nil -- [1..6] = { model, type, name }
+-- (mnm_current_track is declared above, near auto_lock_channel_for_bank.)
+
+-- Machine info backing a bank's display: banks 1-6 map straight to MNM
+-- tracks; CUR resolves through the last-queried current audio track.
+local function machine_for_bank(bank)
+  if not mnm_machines then return nil end
+  if bank <= 6 then return mnm_machines[bank] end
+  return mnm_current_track and mnm_machines[mnm_current_track] or nil
+end
+
+-- Fallback timing: the workspace-kit request reads the live edit buffer
+-- but is not honoured by all firmware. Only if no kit dump arrives within
+-- this window do we fall back to querying the current *saved* kit (which
+-- may be stale, so it must never clobber a workspace result).
+local MNM_QUERY_FALLBACK_TIME = 1.0
+local mnm_query_fallback_clock_id = nil
+local mnm_kit_dump_received = false
+
+local function handle_mnm_sysex(msg)
+  -- Status response to our "current kit?" query: fetch that kit by number.
+  -- Used as a fallback because the workspace-kit request is not honoured
+  -- by all MNM firmware versions.
+  if msg.id == mnm_sysex.STATUS_RESPONSE then
+    local param, value = msg.data[1], msg.data[2]
+    if param == mnm_sysex.STATUS_CURRENT_KIT and value then
+      print(string.format("MNM: current kit is %d, requesting its dump...", value))
+      midi_out:send(mnm_sysex.kit_request(value))
+      midi_out_2:send(mnm_sysex.kit_request(value))
+    elseif param == mnm_sysex.STATUS_CURRENT_AUDIO_TRACK and value and value <= 5 then
+      if mnm_current_track ~= value + 1 then
+        mnm_current_track = value + 1
+        print(string.format("MNM: current audio track is %d", mnm_current_track))
+      end
+    end
+    return
+  end
+  if msg.id ~= mnm_sysex.KIT_DUMP then
+    print(string.format("MNM sysex: ignoring message id 0x%02X (%d data)", msg.id, #msg.data))
+    return
+  end
+  local kit, err = mnm_sysex.parse_kit(msg.data)
+  if not kit then
+    print("MNM kit dump parse failed: " .. err)
+    return
+  end
+  mnm_kit_dump_received = true
+
+  -- Polling fetches the kit continuously; only log when it changed.
+  local changed = (mnm_kit_name ~= kit.name) or (mnm_machines == nil)
+  if not changed then
+    for t = 1, 6 do
+      if mnm_machines[t].model ~= kit.machines[t].model
+          or mnm_machines[t].type ~= kit.machines[t].type then
+        changed = true
+        break
+      end
+    end
+  end
+
+  mnm_kit_name = kit.name
+  mnm_machines = kit.machines
+  if changed then
+    print(string.format("MNM kit '%s' (pos %d):", kit.name, kit.position))
+    for t = 1, 6 do
+      print(string.format("  track %d: %s (model %d, type %d)",
+        t, kit.machines[t].name, kit.machines[t].model, kit.machines[t].type))
+    end
+  end
+end
+
+local mnm_sysex_receiver = mnm_sysex.new_receiver(handle_mnm_sysex)
+
+-- Flip on for verbose sysex logging (receiver start/complete lines);
+-- useful when debugging why a dump isn't being picked up.
+mnm_sysex.debug = false
+
+-- Keeping machine info fresh: the workspace kit and the current audio
+-- track are polled every MNM_POLL_TIME seconds, so kit loads, machine
+-- swaps and track changes all show up within one poll cycle. K1 forces
+-- an immediate refresh.
+local MNM_POLL_TIME = 1.5
+
+-- One machine query: request the workspace kit (live edit buffer) and the
+-- current audio track. Requests go to both output ports since the MNM may
+-- sit on either. If the workspace kit isn't answered within the fallback
+-- window, ask for the current saved kit number and fetch that instead.
+local function request_mnm_machines()
+  print("MNM: requesting workspace kit + current track...")
+  mnm_kit_dump_received = false
+  for _, out in ipairs({ midi_out, midi_out_2 }) do
+    out:send(mnm_sysex.workspace_kit_request())
+    out:send(mnm_sysex.status_request(mnm_sysex.STATUS_CURRENT_AUDIO_TRACK))
+  end
+  if mnm_query_fallback_clock_id then
+    clock.cancel(mnm_query_fallback_clock_id)
+  end
+  mnm_query_fallback_clock_id = clock.run(function()
+    clock.sleep(MNM_QUERY_FALLBACK_TIME)
+    mnm_query_fallback_clock_id = nil
+    if not mnm_kit_dump_received then
+      print("MNM: no workspace kit reply, falling back to saved kit query...")
+      for _, out in ipairs({ midi_out, midi_out_2 }) do
+        out:send(mnm_sysex.status_request(mnm_sysex.STATUS_CURRENT_KIT))
+      end
+    end
+  end)
+end
+
+-- Steady-state polling sends only the two 1-byte status queries; the full
+-- kit dump is fetched from handle_mnm_sysex when the kit number changes.
+-- This keeps the MNM's kit-load view usable while browsing (large sysex
+-- dumps glitch its rendering on some firmware).
+-- HARDWARE NOTE: the current-kit status query (0x70 0x02) is NOT honoured
+-- by this MNM's firmware — worse, it makes the MNM emit a truncated sysex
+-- reply (F0 00 20, then nothing), so it must never be polled. Kit-change
+-- detection therefore uses the workspace kit dump itself.
+local function mnm_poll_loop()
+  while true do
+    clock.sleep(MNM_POLL_TIME)
+    for _, out in ipairs({ midi_out, midi_out_2 }) do
+      out:send(mnm_sysex.workspace_kit_request())
+      out:send(mnm_sysex.status_request(mnm_sysex.STATUS_CURRENT_AUDIO_TRACK))
+    end
+  end
 end
 
 -- Some receivers (e.g. Monomachine) can miss a single STOP if it
@@ -239,7 +502,8 @@ function init()
 
   params:add_separator("Bank MIDI Channels")
   for b = 1, num_banks do
-    params:add_number("bank_" .. b .. "_channel", "Bank " .. b .. " Channel", 1, 16, b)
+    local label = (b == CUR_BANK) and "CUR Bank Channel" or ("Bank " .. b .. " Channel")
+    params:add_number("bank_" .. b .. "_channel", label, 1, 16, bank_default_channel(b))
   end
 
   params:add_separator("MIDI Forwarding")
@@ -262,6 +526,7 @@ function init()
   connect_midi_out_2(params:get("midi_out_device_2"))
 
   clock.run(redraw_loop)
+  clock.run(mnm_poll_loop)
 end
 
 function connect_midi_in(port)
@@ -322,6 +587,7 @@ end
 
 function handle_midi_in(data)
   if not data or #data == 0 then return end
+  if mnm_sysex_receiver:feed(data) then return end
   local status = data[1]
 
   -- System realtime: single-byte, no channel.
@@ -391,8 +657,9 @@ end
 -- new note-on for the active bank's auto-lock channel. Nothing from this
 -- port is forwarded to the output.
 function handle_midi_in_2(data)
-  if not (auto_lock_active or auto_roll_page_active) then return end
   if not data or #data == 0 then return end
+  if mnm_sysex_receiver:feed(data) then return end
+  if not (auto_lock_active or auto_roll_page_active) then return end
 
   local status = data[1]
   if (status & 0xF0) ~= STATUS_NOTE_ON then return end
@@ -401,7 +668,14 @@ function handle_midi_in_2(data)
   if velocity == 0 then return end -- velocity-0 note-on is a note-off
 
   local channel = (status & 0x0F) + 1
-  if channel ~= auto_lock_channel_for_bank(current_bank) then return end
+  local trigger_channel = auto_lock_channel_for_bank(current_bank)
+  if trigger_channel == nil then
+    -- CUR bank with the MNM's selected track not yet known (no status
+    -- poll answered). Say so instead of dropping triggers silently.
+    print("auto-roll: CUR bank trigger ignored — current MNM track unknown")
+    return
+  end
+  if channel ~= trigger_channel then return end
 
   if auto_roll_page_active then
     send_dice_roll()
@@ -414,8 +688,27 @@ function get_current_page_data()
   return page_data[effective_page()]
 end
 
+-- Zero out DPTH on all three LFO pages of the active bank (K2 hold on ALL).
+local function clear_lfo_depths()
+  local ch = get_active_channel()
+  for p, data in ipairs(page_data) do
+    if is_lfo_page(data) then
+      local cc = data.cc_targets[LFO_DPTH_SLOT]
+      bank_values[current_bank][p][LFO_DPTH_SLOT] = 0
+      if cc >= 0 then
+        send_random_cc(cc, 0, ch)
+      end
+    end
+  end
+  print(string.format("LFO depths cleared on bank %d (ch %d)", current_bank, ch))
+end
+
 -- Roll an LFO's PAGE+DEST as one unit: pick a random allowed target pair
 -- and emit both CCs, so the LFO never lands on a roll-excluded param.
+-- Pairs already targeted by the bank's other LFOs are excluded, so no two
+-- LFOs on a track ever modulate the same param. (Rolled targets are always
+-- bucket midpoints, so exact value comparison identifies overlaps; manually
+-- dialed targets off-midpoint are not detected.)
 local function randomize_lfo_target(page)
   local data = page_data[page]
   local values = bank_values[current_bank][page]
@@ -423,15 +716,111 @@ local function randomize_lfo_target(page)
   local dest_cc = data.cc_targets[LFO_DEST_SLOT]
   if page_cc < 0 or dest_cc < 0 then return end
 
-  local ch = get_active_channel()
-  local pair = LFO_TARGET_PAIRS[math.random(#LFO_TARGET_PAIRS)]
+  local taken = {}
+  for p, pdata in ipairs(page_data) do
+    if p ~= page and is_lfo_page(pdata) then
+      local other = bank_values[current_bank][p]
+      taken[other[LFO_PAGE_SLOT] .. ":" .. other[LFO_DEST_SLOT]] = true
+    end
+  end
 
-  values[LFO_PAGE_SLOT] = pair[1]
-  values[LFO_DEST_SLOT] = pair[2]
-  send_random_cc(page_cc, pair[1], ch)
-  send_random_cc(dest_cc, pair[2], ch)
-  print(string.format("🎲 B%d P%d LFO target → CC %d = %d, CC %d = %d (ch %d)",
-    current_bank, page, page_cc, pair[1], dest_cc, pair[2], ch))
+  -- Filter SYN dest slots by the bank's machine (only when it's known;
+  -- unknown machines — no kit query yet, or MID tracks — keep the full
+  -- SYN allowlist). Two exclusions:
+  --   * params the machine doesn't have (e.g. DPRO-WAVE has no 7th knob):
+  --     targeting them would modulate nothing.
+  --   * the mod-source SYNC selector on SID-6581 / DPRO-WAVE: an LFO there
+  --     would sweep the discrete selector, including into PRCH, which we
+  --     forbid for value rolls too.
+  local machine = machine_for_bank(current_bank)
+  local function dest_allowed(desc)
+    if desc.page_name ~= "SYN" or not machine then return true end
+    local param_index = desc.dest_slot - 1
+    if mnm_sysex.synth_param_exists(machine.model, param_index) == false then
+      return false
+    end
+    if mnm_sysex.is_modsrc_param(machine.model, param_index) then
+      return false
+    end
+    return true
+  end
+
+  local candidates = {}
+  for _, desc in ipairs(LFO_TARGET_PAIRS) do
+    if dest_allowed(desc)
+        and not taken[desc.page_val .. ":" .. desc.dest_val] then
+      table.insert(candidates, desc)
+    end
+  end
+  -- Guard: if machine filtering + overlap exclusion ever empty the list,
+  -- fall back to whatever the machine allows (ignoring overlap), then to
+  -- the full list, so a roll always produces a valid target.
+  if #candidates == 0 then
+    for _, desc in ipairs(LFO_TARGET_PAIRS) do
+      if dest_allowed(desc) then table.insert(candidates, desc) end
+    end
+  end
+  if #candidates == 0 then candidates = LFO_TARGET_PAIRS end
+
+  local ch = get_active_channel()
+  local desc = candidates[math.random(#candidates)]
+
+  values[LFO_PAGE_SLOT] = desc.page_val
+  values[LFO_DEST_SLOT] = desc.dest_val
+  send_random_cc(page_cc, desc.page_val, ch)
+  send_random_cc(dest_cc, desc.dest_val, ch)
+  print(string.format("🎲 B%d P%d LFO target → %s.%d: CC %d = %d, CC %d = %d (ch %d)",
+    current_bank, page, desc.page_name, desc.dest_slot,
+    page_cc, desc.page_val, dest_cc, desc.dest_val, ch))
+end
+
+-- Roll the filter band + envelope offsets as one constrained unit.
+-- Emits BASE, WDTH, BDFS, WDFS; guarantees the band is audible at rest
+-- and at envelope peak (see FILTER constrained rolling above).
+local function randomize_filter_band(page)
+  local data = page_data[page]
+  local values = bank_values[current_bank][page]
+  local ccs = {
+    base = data.cc_targets[FILTER_BASE_SLOT],
+    width = data.cc_targets[FILTER_WIDTH_SLOT],
+    bofs = data.cc_targets[FILTER_BOFS_SLOT],
+    wofs = data.cc_targets[FILTER_WOFS_SLOT],
+  }
+  if ccs.base < 0 or ccs.width < 0 or ccs.bofs < 0 or ccs.wofs < 0 then return end
+
+  -- Resting band [lo, hi]: at least FILTER_MIN_WIDTH wide, top reaching
+  -- FILTER_HI_MIN so it always passes meaningful spectrum.
+  local lo = math.random(0, FILTER_LO_MAX)
+  local hi = math.random(math.max(lo + FILTER_MIN_WIDTH, FILTER_HI_MIN), 127)
+  local width = hi - lo
+
+  -- Base offset: signed, bounded by CC range (BDFS = 64 + bofs), the
+  -- band's headroom (peak top <= 127), and the musical sweep cap.
+  local bofs_min = math.max(-64, -lo, -FILTER_MAX_SWEEP)
+  local bofs_max = math.min(63, 127 - hi, FILTER_MAX_SWEEP)
+  local bofs = math.random(bofs_min, bofs_max)
+
+  -- Width offset: peak width stays >= FILTER_MIN_WIDTH, peak top stays
+  -- >= FILTER_HI_MIN (tightens when bofs sweeps the base down) and
+  -- within 0..127.
+  local peak_lo = lo + bofs
+  local wofs_min = math.max(-64, FILTER_MIN_WIDTH - width, FILTER_HI_MIN - peak_lo - width, -FILTER_MAX_SWEEP)
+  local wofs_max = math.min(63, 127 - peak_lo - width, FILTER_MAX_SWEEP)
+  local wofs = math.random(math.min(wofs_min, wofs_max), wofs_max)
+
+  local ch = get_active_channel()
+  local out = {
+    { FILTER_BASE_SLOT, ccs.base, lo },
+    { FILTER_WIDTH_SLOT, ccs.width, width },
+    { FILTER_BOFS_SLOT, ccs.bofs, 64 + bofs },
+    { FILTER_WOFS_SLOT, ccs.wofs, 64 + wofs },
+  }
+  for _, o in ipairs(out) do
+    values[o[1]] = o[3]
+    send_random_cc(o[2], o[3], ch)
+  end
+  print(string.format("🎲 B%d P%d FLT band → lo %d hi %d bofs %+d wofs %+d (ch %d)",
+    current_bank, page, lo, hi, bofs, wofs, ch))
 end
 
 local function randomize_slot(page, slot)
@@ -443,12 +832,53 @@ local function randomize_slot(page, slot)
     return
   end
 
+  if is_filter_page(data) and FILTER_GROUP_SLOTS[slot] then
+    if FILTER_BAND_ROLL_ENABLED then
+      randomize_filter_band(page)
+    end
+    return
+  end
+
   local cc = data.cc_targets[slot]
   if cc < 0 then return end
   if is_roll_excluded(data, slot) then return end
 
+  -- SYNTH mod-source knob (SID-6581 / DPRO-WAVE SYNC): roll only the
+  -- allowed states so it never lands on PRCH ("previous channel"). Keyed
+  -- off the queried machine for this bank, so it only applies when we know
+  -- the track's machine and the slot still points at that SYNTH param.
+  if cc >= 48 and cc <= 55 then
+    local machine = machine_for_bank(current_bank)
+    if machine and mnm_sysex.is_modsrc_param(machine.model, cc - 48) then
+      local ch = get_active_channel()
+      local allowed = mnm_sysex.MODSRC_ALLOWED_VALUES
+      local val = allowed[math.random(#allowed)]
+      values[slot] = val
+      send_random_cc(cc, val, ch)
+      print(string.format("🎲 B%d P%d S%d MODSRC → CC %d = %d (ch %d)",
+        current_bank, page, slot, cc, val, ch))
+      return
+    end
+  end
+
+  -- LFO TRIG: pick from allowed trig-mode buckets (never ONE).
+  if is_lfo_page(data) and slot == LFO_TRIG_SLOT then
+    local ch = get_active_channel()
+    local val = LFO_ALLOWED_TRIG_VALUES[math.random(#LFO_ALLOWED_TRIG_VALUES)]
+    values[slot] = val
+    send_random_cc(cc, val, ch)
+    print(string.format("🎲 B%d P%d S%d TRIG → CC %d = %d (ch %d)",
+      current_bank, page, slot, cc, val, ch))
+    return
+  end
+
   local val_min = params:get("cc_val_min")
   local val_max = params:get("cc_val_max")
+  local floor_val = roll_min_for(data, slot)
+  if floor_val then
+    val_min = math.max(val_min, floor_val)
+    val_max = math.max(val_max, val_min)
+  end
   local ch = get_active_channel()
   local val = math.random(val_min, val_max)
 
@@ -458,27 +888,39 @@ local function randomize_slot(page, slot)
     current_bank, page, slot, cc, val, ch))
 end
 
--- Last page index the ALL-page roll touches: SYNTH through EFFECTS.
--- The LFO pages are deliberately left out of the all-roll.
-local ALL_ROLL_LAST_PAGE = 4
+-- Last page index the ALL-page roll touches (all pages, LFOs included).
+local ALL_ROLL_LAST_PAGE = num_pages
 
 -- On the ALL page, roll SYNTH/AMP/FILTER/EFFECTS of the active bank;
 -- otherwise just the current page. Roll exclusions apply either way.
+-- Roll all slots of one page. Grouped slots roll as one unit via their
+-- first slot: on LFO pages slot 1 rolls the PAGE+DEST pair (DEST is
+-- skipped), and on the FILTER page slot 1 rolls the BASE+WDTH+BDFS+WDFS
+-- band (the other three group slots are skipped).
+local function roll_page(page)
+  local data = page_data[page]
+  for i = 1, num_slots_per_page do
+    local skip = (is_lfo_page(data) and i == LFO_DEST_SLOT)
+      or (is_filter_page(data) and FILTER_GROUP_SLOTS[i] and i ~= FILTER_BASE_SLOT)
+    if not skip then
+      randomize_slot(page, i)
+    end
+  end
+end
+
 function send_dice_roll()
   if current_page == ALL_PAGE then
     for p = 1, ALL_ROLL_LAST_PAGE do
-      for i = 1, num_slots_per_page do
-        randomize_slot(p, i)
+      roll_page(p)
+    end
+  elseif current_page == ALL_NOLFO_PAGE then
+    for p = 1, ALL_ROLL_LAST_PAGE do
+      if not is_lfo_page(page_data[p]) then
+        roll_page(p)
       end
     end
   else
-    for i = 1, num_slots_per_page do
-      -- On LFO pages, slot 1 rolls the PAGE+DEST pair together; skip
-      -- the DEST slot so the pair isn't rolled twice.
-      if not (is_lfo_page(page_data[current_page]) and i == LFO_DEST_SLOT) then
-        randomize_slot(current_page, i)
-      end
-    end
+    roll_page(current_page)
   end
 end
 
@@ -488,7 +930,9 @@ end
 
 function key(n, z)
   if n == 1 then
-    k1_held = (z == 1)
+    if z == 1 then
+      request_mnm_machines()
+    end
   elseif n == 3 then
     if z == 1 then
       send_dice_roll()
@@ -510,21 +954,51 @@ function key(n, z)
     end
   elseif n == 2 then
     if z == 1 then
-      if k2_hold_clock_id then
-        clock.cancel(k2_hold_clock_id)
-        k2_hold_clock_id = nil
+      if current_page == ALL_PAGE then
+        -- ALL page: K2 hold arms the LFO depth clear instead of auto-lock.
+        if lfo_clear_clock_id then
+          clock.cancel(lfo_clear_clock_id)
+          lfo_clear_clock_id = nil
+        end
+        lfo_clear_fired = false
+        lfo_clear_clock_id = clock.run(function()
+          local step = 1 / 30
+          local elapsed = 0
+          lfo_clear_progress = 0
+          while elapsed < LFO_CLEAR_HOLD_TIME do
+            clock.sleep(step)
+            elapsed = elapsed + step
+            lfo_clear_progress = math.min(elapsed / LFO_CLEAR_HOLD_TIME, 1)
+          end
+          clear_lfo_depths()
+          lfo_clear_fired = true
+          lfo_clear_progress = nil
+          lfo_clear_clock_id = nil
+        end)
+      else
+        if k2_hold_clock_id then
+          clock.cancel(k2_hold_clock_id)
+          k2_hold_clock_id = nil
+        end
+        k2_hold_clock_id = clock.run(function()
+          clock.sleep(AUTO_LOCK_HOLD_THRESHOLD)
+          auto_lock_active = true
+          k2_hold_clock_id = nil
+        end)
       end
-      k2_hold_clock_id = clock.run(function()
-        clock.sleep(AUTO_LOCK_HOLD_THRESHOLD)
-        auto_lock_active = true
-        k2_hold_clock_id = nil
-      end)
     else
+      if lfo_clear_clock_id then
+        clock.cancel(lfo_clear_clock_id)
+        lfo_clear_clock_id = nil
+      end
+      lfo_clear_progress = nil
       if k2_hold_clock_id then
         clock.cancel(k2_hold_clock_id)
         k2_hold_clock_id = nil
       end
-      if auto_lock_active then
+      if lfo_clear_fired then
+        lfo_clear_fired = false
+      elseif auto_lock_active then
         auto_lock_active = false
       else
         cycle_edit_mode()
@@ -536,14 +1010,10 @@ end
 function enc(n, d)
   local current_data = get_current_page_data()
   if n == 1 then
-    if k1_held then
-      current_bank = util.clamp(current_bank + d, 1, num_banks)
-    else
-      current_page = util.clamp(current_page + d, ALL_PAGE, num_pages)
-      selected_slot = 1
-    end
+    current_bank = util.clamp(current_bank + d, 1, num_banks)
   elseif n == 2 then
-    selected_slot = util.clamp(selected_slot + d, 1, num_slots_per_page)
+    current_page = util.clamp(current_page + d, FIRST_PAGE, num_pages)
+    selected_slot = 1
   elseif n == 3 then
     if edit_mode == "cc" then
       local new_cc = util.clamp(current_data.cc_targets[selected_slot] + d, -1, 127)
@@ -571,7 +1041,7 @@ function redraw()
   local values = get_active_values()
 
   screen.move(2, 5)
-  screen.text("B" .. current_bank)
+  screen.text(bank_display_name(current_bank))
 
   -- Trigger-mode indicators: K2 hold = single-slot reroll (filled square),
   -- K3 hold = whole-page reroll (outlined square) on incoming triggers.
@@ -584,13 +1054,25 @@ function redraw()
     screen.stroke()
   end
 
-  local title = (current_page == ALL_PAGE) and "ALL" or current_data.title
+  local title
+  if current_page == ALL_PAGE then
+    title = "ALL"
+  elseif current_page == ALL_NOLFO_PAGE then
+    title = "NO LFO"
+  else
+    title = current_data.title
+  end
   local title_x = (128 - (#title * 8)) / 2 + 6
   screen.move(title_x, 5)
   screen.text(title)
 
   screen.move(126, 5)
-  screen.text_right(string.format("CH%02d", get_active_channel()))
+  local machine = machine_for_bank(current_bank)
+  if machine then
+    screen.text_right(machine.name)
+  else
+    screen.text_right(string.format("CH%02d", get_active_channel()))
+  end
 
   for i = 1, 4 do
     draw_slot(i, current_data, values, 2, 15 + (i - 1) * 10)
@@ -603,9 +1085,11 @@ function redraw()
   screen.text("K3: Roll")
   screen.move(54, 60)
   if current_page == ALL_PAGE then
-    screen.text("E1:AL")
+    screen.text("E2:AL")
+  elseif current_page == ALL_NOLFO_PAGE then
+    screen.text("E2:NL")
   else
-    screen.text(string.format("E1:%02d", current_page))
+    screen.text(string.format("E2:%02d", current_page))
   end
   screen.move(4, 60)
   if edit_mode == "cc" then
@@ -621,6 +1105,20 @@ function redraw()
     screen.text(string.format("MIDI %02d", get_active_channel()))
   end
 
+  -- LFO depth clear popup: filling bar while K2 is held on the ALL page.
+  if lfo_clear_progress then
+    screen.level(0)
+    screen.rect(14, 20, 100, 26)
+    screen.fill()
+    screen.level(15)
+    screen.rect(14, 20, 100, 26)
+    screen.stroke()
+    screen.move(64, 30)
+    screen.text_center("CLEAR LFO DPTH")
+    screen.rect(18, 35, math.floor(92 * lfo_clear_progress), 6)
+    screen.fill()
+  end
+
   screen.update()
 end
 
@@ -628,6 +1126,16 @@ function draw_slot(i, page, values, x, y)
   local marker = (selected_slot == i) and ">" or " "
   local cc = page.cc_targets[i]
   local label = page.cc_labels and page.cc_labels[i]
+
+  -- SYNTH page has no static labels: its 8 knobs are machine-specific.
+  -- Once a kit has been queried (K1), label slots whose CC is still a
+  -- SYNTH param (48-55) with the machine's param name for that knob.
+  if not label and cc >= 48 and cc <= 55 then
+    local machine = machine_for_bank(current_bank)
+    if machine then
+      label = mnm_sysex.synth_param_name(machine.model, cc - 48)
+    end
+  end
 
   -- Slot caption: OFF if disabled, otherwise the param label (or CC# if
   -- the page has no labels). The editable CC number for the selected slot
