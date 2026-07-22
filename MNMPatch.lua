@@ -16,12 +16,13 @@
 --     Hold K3: while held, note-ons on the auto-lock trigger port reroll
 --     the whole current page (Auto Page Roll).
 -- E1: Change active bank (1..6 = tracks, 7 = CUR/auto channel).
--- E2: Change page (1..7). Scroll left past SYNTH to the "ALL" page
---     (K3 rolls every page of the active bank at once), then further
---     left to "NO LFO" (K3 rolls every page except the three LFOs).
+-- E2: Change page (1..7). Scroll left past SYNTH to the "ALL" page:
+--     K3 rolls every non-LFO page (SYNTH/AMP/FILTER/EFFECTS) of the
+--     active bank, leaving the three LFOs untouched.
 -- K2: Cycle edit mode (CC / VAL / MIDI channel).
---     On the ALL page, holding K2 fills a popup bar; held to full, it
---     clears DPTH to 0 on all three LFOs of the active bank.
+--     On the ALL page: tapping K2 rolls the three LFO pages of the
+--     active bank; holding K2 fills a popup bar and, held to full,
+--     clears DPTH to 0 on all three LFOs.
 -- E3: Adjust CC, value, or active bank's MIDI channel.
 -- Scroll to CC -1 : OFF feature.
 --
@@ -95,13 +96,12 @@ local function bank_display_name(bank)
   return bank == CUR_BANK and "CUR" or ("B" .. bank)
 end
 
--- Virtual pages left of SYNTH. Both display the SYNTH page's slots:
---   Page  0 ("ALL"):    K3 rolls every page of the active bank at once.
---   Page -1 ("NO LFO"): K3 rolls every non-LFO page (SYNTH/AMP/FILTER/
---                       EFFECTS), leaving all three LFOs untouched.
+-- Virtual page left of SYNTH. Displays the SYNTH page's slots:
+--   Page 0 ("ALL"): K3 rolls every non-LFO page (SYNTH/AMP/FILTER/
+--   EFFECTS) of the active bank; a K2 tap rolls the three LFO pages,
+--   and a K2 hold clears their depths (see LFO depth clear below).
 local ALL_PAGE = 0
-local ALL_NOLFO_PAGE = -1
-local FIRST_PAGE = ALL_NOLFO_PAGE
+local FIRST_PAGE = ALL_PAGE
 local current_page = 1
 
 local function effective_page()
@@ -116,8 +116,10 @@ local LFO_LABELS = { "PAGE", "DEST", "TRIG", "WAVE", "MULT", "SPD", "INTL", "DPT
 local FILTER_LABELS = { "BASE", "WDTH", "HFQ", "LFQ", "ATK", "DEC", "BDFS", "WDFS" }
 
 -- Params (by label) that K3 / auto-lock rolls must never touch.
--- Manual edits (E3 in VAL mode) still work on these slots.
-local LFO_ROLL_EXCLUDE = { SPD = true }
+-- Manual edits (E3 in VAL mode) still work on these slots. SPD is not
+-- excluded but rolls from a constrained BPM-synced allowlist
+-- (see LFO_ALLOWED_SPD_VALUES below).
+local LFO_ROLL_EXCLUDE = { INTL = true }
 
 local page_data = {
   { title = "SYNTH",  cc_targets = {48, 49, 50, 51, 52, 53, 54, 55} },
@@ -125,9 +127,14 @@ local page_data = {
                       cc_labels  = {"ATK", "HOLD", "DEC", "REL", "DIST", "VOL", "PAN", "PORT"},
                       roll_exclude = { ATK = true, HOLD = true, DEC = true, REL = true, VOL = true, PAN = true, PORT = true },
                       roll_min     = { DIST = 64 } },
+  -- FILTER: every param is roll-excluded (manual E3 edits still work).
+  -- The band slots (BASE/WDTH/BDFS/WDFS) are additionally gated by
+  -- FILTER_BAND_ROLL_ENABLED below, so re-enabling rolls here means
+  -- trimming this list AND deciding on the band gate.
   { title = "FILTER", cc_targets = {72, 73, 74, 75, 76, 77, 78, 79},
                       cc_labels  = FILTER_LABELS,
-                      roll_exclude = { ATK = true, DEC = true } },
+                      roll_exclude = { BASE = true, WDTH = true, HFQ = true, LFQ = true,
+                                       ATK = true, DEC = true, BDFS = true, WDFS = true } },
   { title = "EFFECTS",cc_targets = {80, 81, 82, 83, 84, 85, 86, 87},
                       cc_labels  = {"EQF", "EQG", "SRR", "DTIM", "DSND", "DFB", "DBAS", "DWID"},
                       roll_exclude = { SRR = true, DTIM = true, DSND = true, DFB = true, DBAS = true, DWID = true },
@@ -212,9 +219,9 @@ local LFO_DEST_SLOT = 2
 local LFO_TRIG_SLOT = 3
 
 -- LFO TRIG is also a discrete list (5 entries, even buckets). Rolls may
--- pick any mode except ONE and TRIG. Values are bucket midpoints.
+-- only pick FREE or HOLD. Values are bucket midpoints.
 local LFO_TRIG_OPTIONS = { "FREE", "TRIG", "HOLD", "ONE", "HALF" }
-local LFO_TRIG_EXCLUDE = { ONE = true, TRIG = true }
+local LFO_TRIG_EXCLUDE = { TRIG = true, ONE = true, HALF = true }
 local LFO_ALLOWED_TRIG_VALUES = {}
 for idx, name in ipairs(LFO_TRIG_OPTIONS) do
   if not LFO_TRIG_EXCLUDE[name] then
@@ -222,6 +229,16 @@ for idx, name in ipairs(LFO_TRIG_OPTIONS) do
       math.floor((idx - 0.5) * 128 / #LFO_TRIG_OPTIONS))
   end
 end
+
+local LFO_SPD_SLOT = 6
+
+-- LFO SPD constrained rolling: the LFO clock ticks 128 times per bar and
+-- SPD * MULT ticks elapse per bar, so cycle length = 128 / (SPD * MULT)
+-- bars. MULT is always a power of two, so the cycle stays a clean
+-- power-of-two multiple/division of the bar exactly when SPD is one too.
+-- 127 stands in for the unreachable 128 (the manual's own convention for
+-- straight beats: "try setting SPD to 16, 32, 64 or 127").
+local LFO_ALLOWED_SPD_VALUES = { 1, 2, 4, 8, 16, 32, 64, 127 }
 
 local function is_lfo_page(page)
   return page.cc_labels == LFO_LABELS
@@ -310,7 +327,8 @@ local k3_hold_clock_id = nil
 --   Holding K2 on the ALL page shows a popup with a bar that fills over
 --   LFO_CLEAR_HOLD_TIME. If K2 is held until it fills, DPTH of all three
 --   LFOs on the active bank is set to 0 and sent. Releasing early cancels
---   (a short tap still cycles edit mode, as on other pages).
+--   and instead rolls the three LFO pages (K2 tap = LFO roll on ALL;
+--   on other pages a tap still cycles edit mode).
 local LFO_DPTH_SLOT = 8
 local LFO_CLEAR_HOLD_TIME = 0.6
 local lfo_clear_clock_id = nil
@@ -346,6 +364,8 @@ local mnm_machines = nil -- [1..6] = { model, type, name }
 
 -- Machine info backing a bank's display: banks 1-6 map straight to MNM
 -- tracks; CUR resolves through the last-queried current audio track.
+-- Until the track status reply arrives, CUR has no machine to show
+-- (falls back to CH## in the header).
 local function machine_for_bank(bank)
   if not mnm_machines then return nil end
   if bank <= 6 then return mnm_machines[bank] end
@@ -379,7 +399,12 @@ local function handle_mnm_sysex(msg)
     return
   end
   if msg.id ~= mnm_sysex.KIT_DUMP then
-    print(string.format("MNM sysex: ignoring message id 0x%02X (%d data)", msg.id, #msg.data))
+    local bytes = {}
+    for i = 1, math.min(#msg.data, 8) do
+      table.insert(bytes, string.format("%02X", msg.data[i]))
+    end
+    print(string.format("MNM sysex: ignoring message id 0x%02X (%d data: %s)",
+      msg.id, #msg.data, table.concat(bytes, " ")))
     return
   end
   local kit, err = mnm_sysex.parse_kit(msg.data)
@@ -424,10 +449,84 @@ mnm_sysex.debug = false
 -- an immediate refresh.
 local MNM_POLL_TIME = 1.5
 
+-- Selective polling: the workspace kit dump reply is a large sysex blob
+-- that shares the MIDI wire with forwarded clock/notes. The MNM stops
+-- processing its MIDI input for the duration of the dump, so polls are
+-- suspended while transport is running. When stopped, polls run at full
+-- rate (and STOP itself triggers an immediate refresh). K1 always
+-- force-refreshes regardless of transport state.
+--
+-- Script (re)start hole: `transport_running` defaults false even mid-
+-- playback, so a blind poll would dump into a live set. Many clock
+-- sources also keep sending F8 while stopped, so tick presence alone
+-- cannot mean "playing". Until a real START/CONTINUE/STOP arrives,
+-- polling is also suspended while clock is live AND notes were recently
+-- forwarded (mid-playback restart). Clock-while-stopped with no notes
+-- polls normally — the header can show machine names without requiring
+-- a transport message the sequencer may never send.
+local transport_running = false
+local transport_state_known = false
+
+-- Tick timestamping is used for tick-phase-aligned sends below
+-- (ticks flow even when stopped, so alignment always applies).
+local CLOCK_IDLE_TIME = 1.0 -- seconds without a clock tick = no clock source
+local last_clock_time = 0
+
+-- Post-restart mid-play detection (ignored once transport_state_known).
+local LIVE_NOTE_IDLE_TIME = 2.0
+local last_note_forward_time = nil -- set on first forwarded note
+
+local function midi_clock_running()
+  return (util.time() - last_clock_time) < CLOCK_IDLE_TIME
+end
+
+-- Auto kit/track polls when stopped. K1 bypasses via request_mnm_machines().
+local function mnm_polling_suspended()
+  if transport_running then return true end
+  if not transport_state_known
+      and midi_clock_running()
+      and last_note_forward_time
+      and (util.time() - last_note_forward_time) < LIVE_NOTE_IDLE_TIME then
+    return true
+  end
+  return false
+end
+
+-- Tick-phase-aligned sends: while the clock runs, poll requests are not
+-- sent from the poll loop directly (they could land right before a tick
+-- is due and delay it). Instead they are queued here and flushed by the
+-- clock handler immediately AFTER a tick has been forwarded, so the
+-- request bytes go out at the start of the inter-tick gap. The gap is
+-- ~20.8 ms at 120 BPM (24 PPQN) and the status request is ~10 bytes
+-- ≈ 3.2 ms on DIN MIDI, so it fits with a lot of headroom.
+-- Queue entries: { out = <midi device>, data = <message bytes> }.
+local pending_tick_sends = {}
+
+local function send_between_ticks(out, data)
+  if midi_clock_running() then
+    table.insert(pending_tick_sends, { out = out, data = data })
+  else
+    out:send(data)
+  end
+end
+
+-- Called from the clock handler right after a tick is forwarded.
+local function flush_pending_tick_sends()
+  if #pending_tick_sends == 0 then return end
+  for _, msg in ipairs(pending_tick_sends) do
+    msg.out:send(msg.data)
+  end
+  pending_tick_sends = {}
+end
+
 -- One machine query: request the workspace kit (live edit buffer) and the
 -- current audio track. Requests go to both output ports since the MNM may
--- sit on either. If the workspace kit isn't answered within the fallback
--- window, ask for the current saved kit number and fetch that instead.
+-- sit on either.
+-- NO FALLBACK to the saved-kit path: it needs the current-kit status
+-- query (0x70 0x02), which this MNM's firmware answers with a truncated
+-- sysex AND it wedges the sysex responder — after one of those, every
+-- later kit request also comes back truncated until the MNM is
+-- power-cycled. If the workspace request goes unanswered we just say so.
 local function request_mnm_machines()
   print("MNM: requesting workspace kit + current track...")
   mnm_kit_dump_received = false
@@ -442,10 +541,8 @@ local function request_mnm_machines()
     clock.sleep(MNM_QUERY_FALLBACK_TIME)
     mnm_query_fallback_clock_id = nil
     if not mnm_kit_dump_received then
-      print("MNM: no workspace kit reply, falling back to saved kit query...")
-      for _, out in ipairs({ midi_out, midi_out_2 }) do
-        out:send(mnm_sysex.status_request(mnm_sysex.STATUS_CURRENT_KIT))
-      end
+      print("MNM: no workspace kit reply — if this persists, "
+        .. "power-cycle the MNM (wedged sysex responder)")
     end
   end)
 end
@@ -458,12 +555,31 @@ end
 -- by this MNM's firmware — worse, it makes the MNM emit a truncated sysex
 -- reply (F0 00 20, then nothing), so it must never be polled. Kit-change
 -- detection therefore uses the workspace kit dump itself.
+-- Both queries are sent only when mnm_polling_suspended() is false (see
+-- above — an immediate kit request also fires from the STOP handler).
 local function mnm_poll_loop()
+  local was_suspended = false
   while true do
     clock.sleep(MNM_POLL_TIME)
-    for _, out in ipairs({ midi_out, midi_out_2 }) do
-      out:send(mnm_sysex.workspace_kit_request())
-      out:send(mnm_sysex.status_request(mnm_sysex.STATUS_CURRENT_AUDIO_TRACK))
+    local suspended = mnm_polling_suspended()
+    if suspended ~= was_suspended then
+      print(suspended
+        and "MNM: polling suspended"
+        or  "MNM: transport stopped — polling resumed")
+      was_suspended = suspended
+    end
+    -- Clock source vanished with sends still queued (no tick to flush
+    -- them): drop them — they are stale requests superseded by the fresh
+    -- ones this iteration sends directly.
+    if not midi_clock_running() and #pending_tick_sends > 0 then
+      pending_tick_sends = {}
+    end
+    if not suspended then
+      for _, out in ipairs({ midi_out, midi_out_2 }) do
+        send_between_ticks(out, mnm_sysex.workspace_kit_request())
+        send_between_ticks(out,
+          mnm_sysex.status_request(mnm_sysex.STATUS_CURRENT_AUDIO_TRACK))
+      end
     end
   end
 end
@@ -527,6 +643,7 @@ function init()
 
   clock.run(redraw_loop)
   clock.run(mnm_poll_loop)
+  clock.run(cc_send_loop)
 end
 
 function connect_midi_in(port)
@@ -559,11 +676,37 @@ local function should_send_to_port_2(route_param_id)
   return v == ROUTE_PORT_2 or v == ROUTE_BOTH
 end
 
--- Emit a randomizer-generated CC (from a reroll or a manual E3 nudge) to
--- whichever output port(s) the Random CC Out route selects.
+-- Paced CC output: a full ALL-page roll emits ~30 CCs; sent back-to-back
+-- they occupy the DIN wire for tens of ms, delaying forwarded clock ticks
+-- and note-offs (hung notes on the MNM) and flooding its parser. All
+-- randomizer CCs therefore go through a FIFO drained with a small gap
+-- between messages, so clock/note traffic can interleave. Order is
+-- preserved (grouped sends like LFO PAGE+DEST stay paired). Routing is
+-- resolved at send time, matching the previous behaviour.
+local CC_SEND_SPACING = 0.003  -- seconds between queued CC sends
+local cc_send_queue = {}
+
 local function send_random_cc(cc, val, ch)
-  if should_send_to_port_1("out_random_cc") then midi_out:cc(cc, val, ch) end
-  if should_send_to_port_2("out_random_cc") then midi_out_2:cc(cc, val, ch) end
+  table.insert(cc_send_queue, { cc = cc, val = val, ch = ch })
+end
+
+-- Global (not local): init() is defined earlier in the file and resolves
+-- this name at call time, same as redraw_loop.
+function cc_send_loop()
+  while true do
+    local msg = table.remove(cc_send_queue, 1)
+    if msg then
+      if should_send_to_port_1("out_random_cc") then
+        midi_out:cc(msg.cc, msg.val, msg.ch)
+      end
+      if should_send_to_port_2("out_random_cc") then
+        midi_out_2:cc(msg.cc, msg.val, msg.ch)
+      end
+      clock.sleep(CC_SEND_SPACING)
+    else
+      clock.sleep(0.01)
+    end
+  end
 end
 
 local function get_bank_channel(bank)
@@ -592,23 +735,39 @@ function handle_midi_in(data)
 
   -- System realtime: single-byte, no channel.
   if status == STATUS_CLOCK then
+    last_clock_time = util.time()
     if should_send_to_port_1("forward_clock") then midi_out:send(data) end
     if should_send_to_port_2("forward_clock") then midi_out_2:send(data) end
+    -- Queued poll requests go out right after the tick, at the start of
+    -- the inter-tick gap (see send_between_ticks).
+    flush_pending_tick_sends()
     return
   end
   if status == STATUS_START or status == STATUS_CONTINUE then
+    transport_state_known = true
+    transport_running = true
     cancel_pending_stop()
     if should_send_to_port_1("forward_transport") then midi_out:send(data) end
     if should_send_to_port_2("forward_transport") then midi_out_2:send(data) end
     return
   end
   if status == STATUS_STOP then
+    transport_state_known = true
+    transport_running = false
     local send_p1 = should_send_to_port_1("forward_transport")
     local send_p2 = should_send_to_port_2("forward_transport")
     if send_p1 then midi_out:send(data) end
     if send_p2 then midi_out_2:send(data) end
     if send_p1 or send_p2 then
       schedule_stop_resend(data, send_p1, send_p2)
+    end
+    -- Transport just stopped: fetch the kit and current track right away
+    -- so changes made during playback (polling is fully suspended then)
+    -- show up without waiting for the next poll cycle.
+    for _, out in ipairs({ midi_out, midi_out_2 }) do
+      send_between_ticks(out, mnm_sysex.workspace_kit_request())
+      send_between_ticks(out,
+        mnm_sysex.status_request(mnm_sysex.STATUS_CURRENT_AUDIO_TRACK))
     end
     return
   end
@@ -647,15 +806,22 @@ function handle_midi_in(data)
     if params:get("note_channel_mode") == NOTE_CHAN_ACTIVE_BANK then
       out_data = with_channel(data, get_active_channel())
     end
-    if should_send_to_port_1("forward_notes") then midi_out:send(out_data) end
-    if should_send_to_port_2("forward_notes") then midi_out_2:send(out_data) end
+    local sent = false
+    if should_send_to_port_1("forward_notes") then
+      midi_out:send(out_data)
+      sent = true
+    end
+    if should_send_to_port_2("forward_notes") then
+      midi_out_2:send(out_data)
+      sent = true
+    end
+    if sent then last_note_forward_time = util.time() end
     return
   end
 end
 
--- Secondary input: trigger-only. Used by Auto Param Lock to reroll on every
--- new note-on for the active bank's auto-lock channel. Nothing from this
--- port is forwarded to the output.
+-- Secondary input: Auto Param Lock / Auto Page Roll triggers, and sysex
+-- listen (the MNM often sits on this port). Nothing is forwarded out.
 function handle_midi_in_2(data)
   if not data or #data == 0 then return end
   if mnm_sysex_receiver:feed(data) then return end
@@ -729,9 +895,11 @@ local function randomize_lfo_target(page)
   -- SYN allowlist). Two exclusions:
   --   * params the machine doesn't have (e.g. DPRO-WAVE has no 7th knob):
   --     targeting them would modulate nothing.
-  --   * the mod-source SYNC selector on SID-6581 / DPRO-WAVE: an LFO there
-  --     would sweep the discrete selector, including into PRCH, which we
-  --     forbid for value rolls too.
+  --   * mod-source selector knobs (SID-6581 MSR = param 5, DPRO-WAVE SYN
+  --     = param 4): an LFO there would sweep the discrete selector,
+  --     including into PRCH, which we forbid for value rolls too.
+  --     SID's MOD knob (param 4) is a normal continuous param and stays
+  --     a valid LFO target.
   local machine = machine_for_bank(current_bank)
   local function dest_allowed(desc)
     if desc.page_name ~= "SYN" or not machine then return true end
@@ -843,15 +1011,17 @@ local function randomize_slot(page, slot)
   if cc < 0 then return end
   if is_roll_excluded(data, slot) then return end
 
-  -- SYNTH mod-source knob (SID-6581 / DPRO-WAVE SYNC): roll only the
-  -- allowed states so it never lands on PRCH ("previous channel"). Keyed
-  -- off the queried machine for this bank, so it only applies when we know
-  -- the track's machine and the slot still points at that SYNTH param.
+  -- SYNTH mod-source selector knob (SID-6581 MSR / DPRO-WAVE SYN): roll
+  -- only that machine's allowed states so it never lands on PRCH
+  -- ("previous channel"). Keyed off the queried machine for this bank, so
+  -- it only applies when we know the track's machine and the slot still
+  -- points at that SYNTH param.
   if cc >= 48 and cc <= 55 then
     local machine = machine_for_bank(current_bank)
-    if machine and mnm_sysex.is_modsrc_param(machine.model, cc - 48) then
+    local allowed = machine
+      and mnm_sysex.modsrc_allowed_values(machine.model, cc - 48)
+    if allowed then
       local ch = get_active_channel()
-      local allowed = mnm_sysex.MODSRC_ALLOWED_VALUES
       local val = allowed[math.random(#allowed)]
       values[slot] = val
       send_random_cc(cc, val, ch)
@@ -868,6 +1038,18 @@ local function randomize_slot(page, slot)
     values[slot] = val
     send_random_cc(cc, val, ch)
     print(string.format("🎲 B%d P%d S%d TRIG → CC %d = %d (ch %d)",
+      current_bank, page, slot, cc, val, ch))
+    return
+  end
+
+  -- LFO SPD: pick from the BPM-synced allowlist (powers of two, straight
+  -- beats only) so the cycle always stays locked to the bar.
+  if is_lfo_page(data) and slot == LFO_SPD_SLOT then
+    local ch = get_active_channel()
+    local val = LFO_ALLOWED_SPD_VALUES[math.random(#LFO_ALLOWED_SPD_VALUES)]
+    values[slot] = val
+    send_random_cc(cc, val, ch)
+    print(string.format("🎲 B%d P%d S%d SPD → CC %d = %d (ch %d)",
       current_bank, page, slot, cc, val, ch))
     return
   end
@@ -910,10 +1092,7 @@ end
 
 function send_dice_roll()
   if current_page == ALL_PAGE then
-    for p = 1, ALL_ROLL_LAST_PAGE do
-      roll_page(p)
-    end
-  elseif current_page == ALL_NOLFO_PAGE then
+    -- ALL page default: roll every non-LFO page; LFOs roll via K2 tap.
     for p = 1, ALL_ROLL_LAST_PAGE do
       if not is_lfo_page(page_data[p]) then
         roll_page(p)
@@ -921,6 +1100,15 @@ function send_dice_roll()
     end
   else
     roll_page(current_page)
+  end
+end
+
+-- Roll the three LFO pages of the active bank (K2 tap on the ALL page).
+local function roll_lfo_pages()
+  for p, data in ipairs(page_data) do
+    if is_lfo_page(data) then
+      roll_page(p)
+    end
   end
 end
 
@@ -1000,6 +1188,10 @@ function key(n, z)
         lfo_clear_fired = false
       elseif auto_lock_active then
         auto_lock_active = false
+      elseif current_page == ALL_PAGE then
+        -- ALL page: a K2 tap (released before the clear bar fills)
+        -- rolls the three LFO pages instead of cycling edit mode.
+        roll_lfo_pages()
       else
         cycle_edit_mode()
       end
@@ -1057,8 +1249,6 @@ function redraw()
   local title
   if current_page == ALL_PAGE then
     title = "ALL"
-  elseif current_page == ALL_NOLFO_PAGE then
-    title = "NO LFO"
   else
     title = current_data.title
   end
@@ -1086,8 +1276,6 @@ function redraw()
   screen.move(54, 60)
   if current_page == ALL_PAGE then
     screen.text("E2:AL")
-  elseif current_page == ALL_NOLFO_PAGE then
-    screen.text("E2:NL")
   else
     screen.text(string.format("E2:%02d", current_page))
   end

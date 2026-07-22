@@ -113,37 +113,47 @@ function MnmSysex.synth_param_exists(model, param_index)
   return t[param_index] ~= nil
 end
 
--- Modulation-source knobs (SYNC selectors) ----------------------------
--- On some machines the 5th SYNTH knob (param index 4, CC 52) is a
--- modulation-source selector: a discrete 3-state list OFF / SFRQ / PRCH.
--- PRCH means "previous channel" (sync to the track below), which is
--- undesirable when randomizing a single voice, so rolls of this knob must
--- avoid the PRCH bucket. The CC splits 0..127 into 3 even buckets; we
--- allow only the first two, emitted as bucket midpoints (same convention
+-- Modulation-source selector knobs -------------------------------------
+-- Some machines have a SYNTH knob that is a discrete mod-source selector
+-- whose last state is PRCH ("previous channel": sync to the track below).
+-- PRCH is undesirable when randomizing a single voice, so rolls of these
+-- knobs must avoid its bucket, and LFOs must never target them (a swept
+-- selector would pass through PRCH). The CC splits 0..127 into `states`
+-- even buckets; rolls emit only allowed-bucket midpoints (same convention
 -- as the LFO TRIG roll).
-MnmSysex.MODSRC_PARAM_INDEX = 4 -- 0-based: 5th knob, CC 52
-local MODSRC_STATES = 3
-local MODSRC_FORBIDDEN_STATE = 3 -- 1-based: PRCH is the last state
-
--- Machine models whose 5th knob is such a mod-source selector.
-MnmSysex.MODSRC_MACHINES = {
-  [3] = true, -- SID-6581
-  [6] = true, -- DPRO-WAVE
+--
+-- Per machine (0-based param index; states are 1-based):
+--   SID-6581:  param 5 "MSR" — binary MFRQ / PRCH; only MFRQ allowed.
+--              (Param 4 "MOD" is a normal continuous knob: full range.)
+--   DPRO-WAVE: param 4 "SYN" — 3-state OFF / SFRQ / PRCH; PRCH excluded.
+local MODSRC_PARAMS = {
+  [3] = { param_index = 5, states = 2, forbidden_state = 2 }, -- SID-6581 MSR
+  [6] = { param_index = 4, states = 3, forbidden_state = 3 }, -- DPRO-WAVE SYN
 }
 
-MnmSysex.MODSRC_ALLOWED_VALUES = {}
-for state = 1, MODSRC_STATES do
-  if state ~= MODSRC_FORBIDDEN_STATE then
-    table.insert(MnmSysex.MODSRC_ALLOWED_VALUES,
-      math.floor((state - 0.5) * 128 / MODSRC_STATES))
+for _, entry in pairs(MODSRC_PARAMS) do
+  entry.allowed_values = {}
+  for state = 1, entry.states do
+    if state ~= entry.forbidden_state then
+      table.insert(entry.allowed_values,
+        math.floor((state - 0.5) * 128 / entry.states))
+    end
   end
 end
 
 -- True when this machine's given SYNTH param (0-based) is a mod-source
 -- selector whose PRCH state must be excluded from rolls.
 function MnmSysex.is_modsrc_param(model, param_index)
-  return MnmSysex.MODSRC_MACHINES[model] == true
-    and param_index == MnmSysex.MODSRC_PARAM_INDEX
+  local entry = MODSRC_PARAMS[model]
+  return entry ~= nil and entry.param_index == param_index
+end
+
+-- Bucket-midpoint CC values a roll may emit for this machine's mod-source
+-- selector param, or nil when the param is not a mod-source selector.
+function MnmSysex.modsrc_allowed_values(model, param_index)
+  local entry = MODSRC_PARAMS[model]
+  if entry == nil or entry.param_index ~= param_index then return nil end
+  return entry.allowed_values
 end
 
 -- Per MCL's getMNMMachineNameShort: the type byte only distinguishes MID
@@ -256,10 +266,20 @@ function MnmSysex.new_receiver(callback)
   end
 
   function self:feed(chunk)
+    if not chunk or #chunk == 0 then return false end
+    local first = chunk[1]
     -- Realtime messages (clock etc) interleave with sysex as separate
     -- chunks; never consume them so the caller can still forward them.
-    if chunk[1] >= 0xF8 then return false end
-    if not self.active and chunk[1] ~= 0xF0 then return false end
+    if first >= 0xF8 then return false end
+    if not self.active then
+      if first ~= 0xF0 then return false end
+    else
+      -- Mid-dump: USB MIDI delivers channel voice / system-common as
+      -- separate packets. Absorbing them would swallow forwarded notes
+      -- and corrupt the kit buffer. Only continue on data bytes (<0x80),
+      -- a fresh F0, or a trailing F7; leave `active` so the dump can resume.
+      if first >= 0x80 and first ~= 0xF0 and first ~= 0xF7 then return false end
+    end
     for _, b in ipairs(chunk) do
       if b == 0xF0 then
         if MnmSysex.debug then print("mnm_sysex: sysex start") end
